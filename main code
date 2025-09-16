@@ -1,0 +1,357 @@
+# main_joint_unsup_fixed.py
+"""
+.
+Includes:
+- hat_P update with kappa_time and epsilon smoothing
+- g_r dissimilarity computation
+- Modulated delta for edge assignments
+- MEC penalties (capacity & delay)
+"""
+
+import random
+from dataclasses import dataclass
+from typing import Dict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+# -----------------------
+# 1) Small CNN
+# -----------------------
+class SimpleCNN(nn.Module):
+    def __init__(self, in_ch=1, n_classes=10, img_size=28):
+        super(SimpleCNN, self).__init__()
+        self.conv1 = nn.Conv2d(in_ch, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
+
+        # compute flatten size automatically
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, in_ch, img_size, img_size)
+            out = self._forward_conv(dummy_input)
+            flatten_size = out.view(1, -1).size(1)
+            print(f"[INFO] Flatten size = {flatten_size} for img_size={img_size}, in_ch={in_ch}")
+
+        self.fc1 = nn.Linear(flatten_size, 128)
+        self.fc2 = nn.Linear(128, n_classes)
+
+    def _forward_conv(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        return x
+
+    def forward(self, x):
+        x = self._forward_conv(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+# -----------------------
+# 2) Unsupervised split (quantity skew)
+# -----------------------
+def split_unsupervised_quantity(indices, n_users=10, min_size=10, max_size_ratio=0.3, seed=0) -> Dict[int, list]:
+    random.seed(seed)
+    total = len(indices)
+    shuffled = indices.copy()
+    random.shuffle(shuffled)
+    splits = {}
+    used = 0
+    for u in range(n_users):
+        if u == n_users - 1:
+            splits[u] = shuffled[used:]
+        else:
+            max_size = max(min_size, int(total * max_size_ratio))
+            size = random.randint(min_size, max_size)
+            size = min(size, total - used - (n_users - u - 1) * min_size)
+            if size <= 0:
+                size = min_size
+            splits[u] = shuffled[used:used+size]
+            used += size
+            if used >= total:
+                for uu in range(u+1, n_users):
+                    splits[uu] = []
+                break
+    return splits
+
+def build_dataloaders_unsupervised(dataset="cifar10", batch_size=128, n_users=10, seed=0):
+    if dataset.lower() == "mnist":
+        tfm = transforms.Compose([transforms.ToTensor()])
+        train = datasets.MNIST(root="./data", train=True, download=True, transform=tfm)
+        test  = datasets.MNIST(root="./data", train=False, download=True, transform=tfm)
+        in_ch = 1
+        img_size = 28
+    elif dataset.lower() in ["cifar10", "cifar"]:
+        tfm = transforms.Compose([transforms.ToTensor()])
+        train = datasets.CIFAR10(root="./data", train=True, download=True, transform=tfm)
+        test  = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm)
+        in_ch = 3
+        img_size = 32
+    else:
+        raise ValueError("dataset must be 'mnist' or 'cifar10'.")
+
+    idxs = list(range(len(train)))
+    user_splits = split_unsupervised_quantity(idxs, n_users=n_users, seed=seed)
+
+    user_loaders = {}
+    for r, idx in user_splits.items():
+        subset = Subset(train, idx)
+        drop_last = len(subset) >= batch_size
+        user_loaders[r] = DataLoader(subset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
+
+    test_loader = DataLoader(test, batch_size=batch_size, shuffle=False)
+    return user_loaders, test_loader, in_ch, img_size
+
+# -----------------------
+# 3) MEC config & helpers
+# -----------------------
+@dataclass
+class MECConfig:
+    S: int
+    C_edge: torch.Tensor
+    C_central: float
+    d: torch.Tensor
+    D: torch.Tensor
+    B: float
+    V_edge: float
+    V_central: float
+    Tmax: float = 1.0
+    lambda_cap: float = 10.0
+    lambda_delay: float = 1.0
+    lambda_reg: float = 1e-4
+
+def capacity_util(alpha: torch.Tensor, delta: torch.Tensor, D: torch.Tensor, C_edge: torch.Tensor):
+    load = (delta * ((1 - alpha).unsqueeze(1) * D.unsqueeze(1))).sum(dim=0)
+    return load / (C_edge + 1e-8)
+
+def penalty_capacity(u: torch.Tensor):
+    return torch.square(torch.clamp(u - 1.0, min=0.0)).sum()
+
+def realistic_delay_model(mec: MECConfig, alpha: torch.Tensor, delta: torch.Tensor):
+    R, S = delta.shape
+    uplink_central = alpha * (mec.B / mec.V_central)
+    uplink_edge = ((1 - alpha).unsqueeze(1) * (mec.B / mec.V_edge) * delta).sum(dim=1)
+    compute_edge = ((1 - alpha).unsqueeze(1) * mec.D.unsqueeze(1) * (delta / (mec.C_edge + 1e-8))).sum(dim=1)
+    compute_central = alpha * (mec.D / (mec.C_central + 1e-8))
+    return uplink_central + uplink_edge + compute_edge + compute_central
+
+def penalty_delay(T_actual: torch.Tensor, Tmax: float):
+    tau = T_actual / (Tmax + 1e-8)
+    return torch.square(torch.clamp(tau - 1.0, min=0.0)).mean()
+
+# -----------------------
+# 4) Joint unsupervised training
+# -----------------------
+def train_joint_unsupervised(
+    dataset="mnist",
+    n_users=10,
+    steps=600,
+    batch_size=128,
+    lr_theta=1e-3,
+    lr_a=5e-3,
+    lr_b=5e-3,
+    S: int = 3,
+    C_hat: float = 400.0,
+    C_s: float = 15.0,
+    gamma: float = 0.1,
+    B: float = 0.15,
+    T_max: float = 0.05,
+    V_edge: float = 4.5,
+    V_central: float = 3.0,
+    kappa_time: float = 0.1,
+    epsilon: float = 1e-6,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+):
+    # --- dataloaders
+    user_loaders, test_loader, in_ch, img_size = build_dataloaders_unsupervised(
+        dataset, batch_size=batch_size, n_users=n_users
+    )
+    R = len(user_loaders)
+    K = 10
+    w_k = torch.ones(K, device=device) / K
+
+    # --- models
+    central_model = SimpleCNN(in_ch=in_ch, n_classes=K, img_size=img_size).to(device)
+    edge_models = nn.ModuleList([SimpleCNN(in_ch=in_ch, n_classes=K, img_size=img_size).to(device) for _ in range(S)])
+    all_params = list(central_model.parameters()) + [p for m in edge_models for p in m.parameters()]
+    opt_theta = torch.optim.Adam(all_params, lr=lr_theta)
+    loss_fn = nn.CrossEntropyLoss(reduction="none")
+
+    # --- MEC config
+    C_edge = torch.full((S,), C_s, device=device)
+    d = torch.rand(R, S, device=device) + 0.3
+    D = torch.full((R,), B * gamma, device=device)
+    mec = MECConfig(S=S, C_edge=C_edge, C_central=C_hat, d=d, D=D,
+                    B=B, V_edge=V_edge, V_central=V_central, Tmax=T_max)
+
+    # --- learnable alpha & delta
+    a = torch.zeros(R, device=device, requires_grad=True)
+    b = torch.zeros(R, S, device=device, requires_grad=True)
+    opt_a = torch.optim.Adam([a], lr=lr_a)
+    opt_b = torch.optim.Adam([b], lr=lr_b)
+
+    # --- previous P_r
+    P_r_previous = torch.full((R, K), 1.0 / K, device=device)
+
+    # --- iterators for user loaders
+    iters = {r: iter(loader) for r, loader in user_loaders.items()}
+
+    def next_batch(r):
+        loader = user_loaders[r]
+        try:
+            x, y = next(iters[r])
+        except Exception:
+            iters[r] = iter(loader)
+            try:
+                x, y = next(iters[r])
+            except Exception:
+                x = torch.zeros((1, in_ch, img_size, img_size), device=device)
+                y = torch.zeros((1,), dtype=torch.long, device=device)
+                return x, y
+        return x.to(device), y.to(device)
+
+    # --- training loop
+    for step in range(1, steps + 1):
+        central_model.train()
+        for m in edge_models: m.train()
+        opt_theta.zero_grad()
+        opt_a.zero_grad()
+        opt_b.zero_grad()
+
+        alpha = torch.sigmoid(a)
+        delta = torch.softmax(b, dim=1)
+
+        L_c_list = []
+        L_edge_rows = []
+        hatP_list = []
+
+        for r in range(R):
+            x, y = next_batch(r)
+            # central model loss
+            logits_c = central_model(x)
+            L_c_list.append(loss_fn(logits_c, y).mean())
+
+            # edge losses
+            l_edge_per_s = []
+            for s in range(S):
+                logits_s = edge_models[s](x)
+                l_edge_per_s.append(loss_fn(logits_s, y).mean())
+            if len(l_edge_per_s) == 0:
+                L_edge_rows.append(torch.zeros(0, device=device))
+            else:
+                L_edge_rows.append(torch.stack(l_edge_per_s, dim=0))
+
+            # histogram / hat_P
+            hist_r = torch.zeros(K, device=device)
+            if y.numel() > 0:
+                labels = y.detach().long().cpu().numpy()
+                for lab in labels:
+                    if 0 <= lab < K:
+                        hist_r[lab] += 1.0
+                hist_r = hist_r / max(1.0, float(y.size(0)))
+            else:
+                hist_r = P_r_previous[r]
+
+            mask_seen = (P_r_previous[r] > 0.0)
+            Kprime = int(mask_seen.sum().item())
+            decay_factor = float(max(-1, Kprime - K))
+            scaled = P_r_previous[r] * torch.exp(torch.tensor(kappa_time * decay_factor, device=device))
+            hat_P_r = torch.where(mask_seen, scaled, torch.full_like(P_r_previous[r], epsilon))
+            hat_P_r = hat_P_r / (hat_P_r.sum() + 1e-12)
+
+            hatP_list.append(hat_P_r)
+            P_r_previous[r] = hist_r.detach().clone()
+
+        # compute P_global and g_r
+        hatP_stack = torch.stack(hatP_list, dim=0)
+        P_global = hatP_stack.mean(dim=0)
+        diffs = torch.abs(hatP_stack - P_global.unsqueeze(0))
+        weighted = (diffs * w_k.unsqueeze(0)).sum(dim=1)
+        g_r = torch.exp(-weighted)
+
+        delta_mod = delta * g_r.unsqueeze(1)
+        row_sums = delta_mod.sum(dim=1, keepdim=True)
+        row_sums = torch.where(row_sums <= 0, torch.ones_like(row_sums), row_sums)
+        delta_mod = delta_mod / row_sums
+
+        # compute task losses
+        L_vec_c = torch.stack(L_c_list, dim=0)
+        if len(L_edge_rows) > 0 and L_edge_rows[0].numel() > 0:
+            L_edge_mat = torch.stack(L_edge_rows, dim=0)
+        else:
+            L_edge_mat = torch.zeros((R, S), device=device)
+        L_CS = (alpha * L_vec_c).sum() / (R + 1e-12)
+        w_edge = (1 - alpha).unsqueeze(1) * delta_mod
+        L_edge = (w_edge * L_edge_mat).sum() / (R + 1e-12)
+        task_loss = L_CS + L_edge
+
+        # penalties
+        u = capacity_util(alpha, delta_mod, mec.D, mec.C_edge)
+        P_cap = penalty_capacity(u)
+        T_actual = realistic_delay_model(mec, alpha, delta_mod)
+        P_delay = penalty_delay(T_actual, mec.Tmax)
+        reg = sum((p**2).sum() for p in all_params)
+        total = task_loss + mec.lambda_cap * P_cap + mec.lambda_delay * P_delay + mec.lambda_reg * reg
+
+        total.backward()
+        opt_theta.step()
+        opt_a.step()
+        opt_b.step()
+
+        if step % 50 == 0 or step == 1:
+            with torch.no_grad():
+                delta_adj = delta_mod.detach()
+                hard = torch.argmax(delta_adj, dim=1)
+                counts = torch.bincount(hard, minlength=S).tolist()
+                print(f"[{step:04d}] total={total.item():.4f} task={task_loss.item():.4f} "
+                      f"L_CS={L_CS.item():.4f} L_edge={L_edge.item():.4f} "
+                      f"Pcap={P_cap.item():.4f} Pdelay={P_delay.item():.4f} "
+                      f"alphā={float(alpha.mean().item()):.3f} mean_delay={float(T_actual.mean().item()):.4f}s assign={counts}")
+
+    # final assignments
+    with torch.no_grad():
+        delta = torch.softmax(b, dim=1)
+        delta_adj = (delta * g_r.unsqueeze(1))
+        delta_adj = delta_adj / (delta_adj.sum(dim=1, keepdim=True) + 1e-12)
+        hard_assign = torch.argmax(delta_adj, dim=1)
+    print("Final hard assignments (first 10):", hard_assign[:10].tolist())
+
+    # test central model
+    central_model.eval()
+    correct, total_n = 0, 0
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(device), y.to(device)
+            pred = central_model(x).argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total_n += y.numel()
+    print(f"Test Acc (central): {100.0 * correct / total_n:.2f}%")
+
+    return {"alpha": alpha.detach().cpu(),
+            "delta": delta_adj.detach().cpu(),
+            "T_actual": T_actual.detach().cpu()}
+
+# -----------------------
+# Example run
+# -----------------------
+if __name__ == "__main__":
+    traces = train_joint_unsupervised(
+        dataset="cifar10",
+        n_users=10,
+        steps=1000,
+        batch_size=8,
+        lr_theta=5e-3,
+        lr_a=5e-3,
+        lr_b=5e-3,
+        S=3,
+        C_hat=400.0,
+        C_s=15.0,
+        gamma=0.1,
+        B=0.15,
+        T_max=0.05,
+        V_edge=4.5,
+        V_central=3.0,
+        kappa_time=0.1,
+        epsilon=1e-6
+    )
